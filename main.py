@@ -1,16 +1,28 @@
 import os
 import time
-from datetime import datetime, timedelta, timezone
 import math
-import pandas as pd
+from datetime import datetime, timedelta, timezone
+from typing import List
+
 import numpy as np
+import pandas as pd
 import pandas_ta as ta
 from twilio.rest import Client as TwilioClient
 
-from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.historical import (
+    StockHistoricalDataClient,
+    CryptoHistoricalDataClient,
+)
+from alpaca.data.requests import (
+    StockBarsRequest,
+    CryptoBarsRequest,
+)
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.enums import DataFeed, Adjustment
 
+# ───────────────────────────
+# Environment / Config
+# ───────────────────────────
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() in {"1", "true", "yes"}
@@ -21,16 +33,19 @@ TWILIO_FROM = os.getenv("TWILIO_FROM")   # e.g. +12025550123
 ALERT_TO    = os.getenv("ALERT_TO")       # e.g. +13035550123
 
 # Assets to monitor
-STOCK_ETFS = ["VIG", "BND", "GLD"]
-CRYPTO_PAIRS = ["BTC/USD"]  # Alpaca crypto format
+STOCK_ETFS: List[str] = ["VIG", "BND", "GLD"]  # VNQ dropped
+CRYPTO_PAIRS: List[str] = ["BTC/USD"]          # Alpaca crypto symbol format
 
-TIMEFRAME = TimeFrame.Minute * 15  # 15-minute bars
-# Need at least 240 bars for the long SMA; fetch a cushion
+# 15-minute bars
+TIMEFRAME = TimeFrame(15, TimeFrameUnit.Minute)
+
+# Need at least 240 bars for long SMA; fetch a cushion
 LOOKBACK_BARS = 280
 
-# ---- Helpers ----
-
-def now_utc():
+# ───────────────────────────
+# Helpers
+# ───────────────────────────
+def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 def next_quarter_hour(dt: datetime) -> datetime:
@@ -56,12 +71,12 @@ def to_df(bars) -> pd.DataFrame:
     rows = []
     for b in bars:
         rows.append({
-            "t": b.timestamp,  # already timezone-aware UTC
+            "t": b.timestamp,  # timezone-aware UTC (pandas will keep tz)
             "o": float(b.open),
             "h": float(b.high),
             "l": float(b.low),
             "c": float(b.close),
-            "v": float(b.volume) if hasattr(b, 'volume') and b.volume is not None else np.nan,
+            "v": float(getattr(b, "volume", np.nan)) if getattr(b, "volume", None) is not None else np.nan,
         })
     df = pd.DataFrame(rows).sort_values("t").reset_index(drop=True)
     return df
@@ -74,16 +89,26 @@ def compute_indicators(df: pd.DataFrame):
     sma240 = ta.sma(c, length=240)
     return rsi14.iloc[-1], sma60.iloc[-1], sma240.iloc[-1]
 
-def condition_to_buy(rsi, ma60, ma240):
-    if any(map(lambda x: x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))), [rsi, ma60, ma240])):
+def is_nan_or_inf(x: float) -> bool:
+    return (
+        x is None
+        or (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))
+    )
+
+def condition_to_buy(rsi, ma60, ma240) -> bool:
+    if any(is_nan_or_inf(v) for v in [rsi, ma60, ma240]):
         return False
     return (rsi <= 30) and (ma60 < ma240)
 
-# ---- Data Fetchers ----
-
+# ───────────────────────────
+# Data clients
+# ───────────────────────────
 stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 crypto_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
+# ───────────────────────────
+# Fetchers
+# ───────────────────────────
 def fetch_stock_bars(symbol: str, end: datetime) -> pd.DataFrame:
     start = end - timedelta(minutes=LOOKBACK_BARS * 15 + 60)
     req = StockBarsRequest(
@@ -91,12 +116,13 @@ def fetch_stock_bars(symbol: str, end: datetime) -> pd.DataFrame:
         timeframe=TIMEFRAME,
         start=start,
         end=end,
-        adjustment="split",
-        feed="sip" if not ALPACA_PAPER else "iex",  # paper often limited to IEX
+        adjustment=Adjustment.SPLIT,
+        feed=DataFeed.IEX if ALPACA_PAPER else DataFeed.SIP,
         limit=LOOKBACK_BARS,
     )
     resp = stock_client.get_bars(req)
-    bars = resp[symbol]
+    # In alpaca-py 0.23.0, use resp.data[symbol] if present
+    bars = resp.data.get(symbol, [])
     return to_df(bars)
 
 def fetch_crypto_bars(pair: str, end: datetime) -> pd.DataFrame:
@@ -109,15 +135,16 @@ def fetch_crypto_bars(pair: str, end: datetime) -> pd.DataFrame:
         limit=LOOKBACK_BARS,
     )
     resp = crypto_client.get_bars(req)
-    bars = resp[pair]
+    bars = resp.data.get(pair, [])
     return to_df(bars)
 
-# ---- Main loop ----
-
-def evaluate_once() -> list[str]:
+# ───────────────────────────
+# Main evaluation loop
+# ───────────────────────────
+def evaluate_once() -> List[str]:
     ts = now_utc()
     print(f"[INFO] Evaluating at {ts.isoformat()}")
-    candidates = []
+    candidates: List[str] = []
 
     # Stocks/ETFs
     for sym in STOCK_ETFS:
@@ -143,8 +170,8 @@ def evaluate_once() -> list[str]:
             rsi, ma60, ma240 = compute_indicators(df)
             print(f"[DEBUG] {pair} RSI14={rsi:.2f} SMA60={ma60:.4f} SMA240={ma240:.4f}")
             if condition_to_buy(rsi, ma60, ma240):
-                # Present as BTC for the SMS label
-                label = pair.replace("/", "")  # BTCUSD
+                # Present nicely in SMS (BTCUSD)
+                label = pair.replace("/", "")
                 candidates.append(label)
         except Exception as e:
             print(f"[ERROR] {pair} fetch/eval failed: {e}")
@@ -167,6 +194,9 @@ def loop_forever():
         print(f"[INFO] Sleeping {int(sleep_s)}s until {nxt.isoformat()}")
         time.sleep(sleep_s)
 
+# ───────────────────────────
+# Entrypoint
+# ───────────────────────────
 if __name__ == "__main__":
     required = [
         ("ALPACA_API_KEY", ALPACA_API_KEY),
