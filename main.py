@@ -21,7 +21,7 @@ TWILIO_FROM = os.getenv("TWILIO_FROM")   # e.g. +12025550123
 ALERT_TO    = os.getenv("ALERT_TO")       # e.g. +13035550123
 
 # Assets to monitor
-STOCK_ETFS = ["VIG", "BND", "GLD", "VNQ"]
+STOCK_ETFS = ["VIG", "BND", "GLD"]
 CRYPTO_PAIRS = ["BTC/USD"]  # Alpaca crypto format
 
 TIMEFRAME = TimeFrame.Minute * 15  # 15-minute bars
