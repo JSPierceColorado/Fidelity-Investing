@@ -2,9 +2,10 @@
 RSI/MA Alert Bot (15m bars): VIG, BND, GLD, BTC
 - Uses Alpaca Market Data (stocks/ETFs + crypto) for indicators
 - Sends alerts via Telegram (free)
+- Buy alerts are minimal: "buy <asset>" (no timestamp)
 - Optional boot notification controlled by SEND_BOOT_TELEGRAM
 
-Set these env vars (see .env example below):
+Env vars:
   # Alpaca
   ALPACA_API_KEY=...
   ALPACA_SECRET_KEY=...
@@ -124,7 +125,6 @@ def to_df_from_response(resp, symbol: str) -> pd.DataFrame:
     return pd.DataFrame(columns=["t","o","h","l","c","v"])
 
 def compute_indicators(df: pd.DataFrame):
-    # Close series
     c = df["c"].astype(float)
     rsi14 = ta.rsi(c, length=14)
     sma60 = ta.sma(c, length=60)
@@ -208,8 +208,7 @@ def evaluate_once() -> List[str]:
             rsi, ma60, ma240 = compute_indicators(df)
             print(f"[DEBUG] {pair} RSI14={rsi:.2f} SMA60={ma60:.4f} SMA240={ma240:.4f}")
             if condition_to_buy(rsi, ma60, ma240):
-                # Present nicely in Telegram (BTCUSD)
-                label = pair.replace("/", "")
+                label = pair.replace("/", "")  # BTC/USD -> BTCUSD
                 candidates.append(label)
         except Exception as e:
             print(f"[ERROR] {pair} fetch/eval failed: {e}")
@@ -220,9 +219,10 @@ def loop_forever():
     while True:
         picks = evaluate_once()
         if picks:
-            msg = f"BUY SIGNAL {now_utc().strftime('%Y-%m-%d %H:%M:%SZ')}: " + ", ".join(picks)
-            print("[ALERT] ", msg)
-            send_telegram(msg)
+            for asset in picks:
+                msg = f"buy {asset}"  # minimal alert; no timestamp
+                print("[ALERT]", msg)
+                send_telegram(msg)
         else:
             print("[INFO] No signals this interval.")
 
