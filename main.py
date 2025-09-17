@@ -29,8 +29,12 @@ ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() in {"1", "true", "yes"}
 
 TWILIO_SID = os.getenv("TWILIO_SID")
 TWILIO_AUTH = os.getenv("TWILIO_AUTH")
-TWILIO_FROM = os.getenv("TWILIO_FROM")   # e.g. +12025550123
-ALERT_TO    = os.getenv("ALERT_TO")       # e.g. +13035550123
+TWILIO_FROM = os.getenv("TWILIO_FROM")         # e.g. +12025550123
+TWILIO_MG_SID = os.getenv("TWILIO_MG_SID")     # optional Messaging Service SID (MG...)
+ALERT_TO    = os.getenv("ALERT_TO")            # e.g. +13035550123
+
+# Boot SMS toggle: send a "bot ran successfully" text on startup if true/1/yes
+SEND_BOOT_SMS = os.getenv("SEND_BOOT_SMS", "false").lower() in {"1", "true", "yes"}
 
 # Assets to monitor
 STOCK_ETFS: List[str] = ["VIG", "BND", "GLD"]  # VNQ dropped
@@ -61,11 +65,16 @@ def next_quarter_hour(dt: datetime) -> datetime:
     return next_dt
 
 def send_sms(message: str):
-    if not (TWILIO_SID and TWILIO_AUTH and TWILIO_FROM and ALERT_TO):
-        print("[WARN] Twilio env vars not all set; skipping SMS. Message would be:\n", message)
+    if not (TWILIO_SID and TWILIO_AUTH and ALERT_TO and (TWILIO_FROM or TWILIO_MG_SID)):
+        print("[WARN] Twilio env vars incomplete; skipping SMS. Would send:\n", message)
         return
     client = TwilioClient(TWILIO_SID, TWILIO_AUTH)
-    client.messages.create(body=message, from_=TWILIO_FROM, to=ALERT_TO)
+    kwargs = {"to": ALERT_TO, "body": message}
+    if TWILIO_MG_SID:
+        kwargs["messaging_service_sid"] = TWILIO_MG_SID
+    else:
+        kwargs["from_"] = TWILIO_FROM
+    client.messages.create(**kwargs)
     print("[INFO] SMS sent")
 
 def to_df_from_bars_list(bars_list) -> pd.DataFrame:
@@ -226,5 +235,9 @@ if __name__ == "__main__":
     missing = [k for k, v in required if not v]
     if missing:
         raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
+
+    # Send a one-time boot SMS if enabled
+    if SEND_BOOT_SMS:
+        send_sms(f"✅ Bot started successfully at {now_utc().strftime('%Y-%m-%d %H:%M:%SZ')} (15m; ETFs: {', '.join(STOCK_ETFS)}; Crypto: {', '.join([p.replace('/', '') for p in CRYPTO_PAIRS])})")
 
     loop_forever()
