@@ -1,3 +1,21 @@
+"""
+RSI/MA Alert Bot (15m bars): VIG, BND, GLD, BTC
+- Uses Alpaca Market Data (stocks/ETFs + crypto) for indicators
+- Sends alerts via Telegram (free)
+- Optional boot notification controlled by SEND_BOOT_TELEGRAM
+
+Set these env vars (see .env example below):
+  # Alpaca
+  ALPACA_API_KEY=...
+  ALPACA_SECRET_KEY=...
+  ALPACA_PAPER=true|false
+
+  # Telegram
+  TELEGRAM_BOT_TOKEN=123456:ABC...
+  TELEGRAM_CHAT_ID=123456789           # or -100xxxxxxxxxxxx for groups/channels
+  SEND_BOOT_TELEGRAM=true|false
+"""
+
 import os
 import time
 import math
@@ -7,7 +25,7 @@ from typing import List
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
-from twilio.rest import Client as TwilioClient
+import requests
 
 from alpaca.data.historical import (
     StockHistoricalDataClient,
@@ -27,25 +45,20 @@ ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() in {"1", "true", "yes"}
 
-TWILIO_SID = os.getenv("TWILIO_SID")
-TWILIO_AUTH = os.getenv("TWILIO_AUTH")
-TWILIO_FROM = os.getenv("TWILIO_FROM")         # e.g. +12025550123
-TWILIO_MG_SID = os.getenv("TWILIO_MG_SID")     # optional Messaging Service SID (MG...)
-ALERT_TO    = os.getenv("ALERT_TO")            # e.g. +13035550123
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+SEND_BOOT_TELEGRAM = os.getenv("SEND_BOOT_TELEGRAM", "false").lower() in {"1", "true", "yes"}
 
-# Boot SMS toggle: send a "bot ran successfully" text on startup if true/1/yes
-SEND_BOOT_SMS = os.getenv("SEND_BOOT_SMS", "false").lower() in {"1", "true", "yes"}
-
-# Assets to monitor
-STOCK_ETFS: List[str] = ["VIG", "BND", "GLD"]  # VNQ dropped
-CRYPTO_PAIRS: List[str] = ["BTC/USD"]          # Alpaca crypto symbol format
+# Assets to monitor (VNQ removed)
+STOCK_ETFS: List[str] = ["VIG", "BND", "GLD"]
+CRYPTO_PAIRS: List[str] = ["BTC/USD"]  # Alpaca crypto symbol format
 
 # 15-minute bars
 TIMEFRAME = TimeFrame(15, TimeFrameUnit.Minute)
 
 # Need at least 240 bars for long SMA
-LOOKBACK_DAYS_STOCK = 30         # calendar days for equities (market hours only)
-LOOKBACK_BARS_CRYPTO = 280       # bars for crypto (24/7), keeps cushion
+LOOKBACK_DAYS_STOCK = 30     # calendar days (market hours only)
+LOOKBACK_BARS_CRYPTO = 280   # bars for crypto (24/7), keeps cushion
 
 # ───────────────────────────
 # Helpers
@@ -64,18 +77,16 @@ def next_quarter_hour(dt: datetime) -> datetime:
             next_dt = next_dt + timedelta(days=1)
     return next_dt
 
-def send_sms(message: str):
-    if not (TWILIO_SID and TWILIO_AUTH and ALERT_TO and (TWILIO_FROM or TWILIO_MG_SID)):
-        print("[WARN] Twilio env vars incomplete; skipping SMS. Would send:\n", message)
+def send_telegram(text: str):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        print("[WARN] Telegram env vars not set; skipping Telegram. Would send:\n", text)
         return
-    client = TwilioClient(TWILIO_SID, TWILIO_AUTH)
-    kwargs = {"to": ALERT_TO, "body": message}
-    if TWILIO_MG_SID:
-        kwargs["messaging_service_sid"] = TWILIO_MG_SID
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+    if r.ok:
+        print("[INFO] Telegram sent")
     else:
-        kwargs["from_"] = TWILIO_FROM
-    client.messages.create(**kwargs)
-    print("[INFO] SMS sent")
+        print("[ERROR] Telegram failed", r.status_code, r.text)
 
 def to_df_from_bars_list(bars_list) -> pd.DataFrame:
     """Convert a list of Bar objects to a DataFrame."""
@@ -121,10 +132,7 @@ def compute_indicators(df: pd.DataFrame):
     return rsi14.iloc[-1], sma60.iloc[-1], sma240.iloc[-1]
 
 def is_nan_or_inf(x: float) -> bool:
-    return (
-        x is None
-        or (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))
-    )
+    return x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))
 
 def condition_to_buy(rsi, ma60, ma240) -> bool:
     if any(is_nan_or_inf(v) for v in [rsi, ma60, ma240]):
@@ -200,7 +208,7 @@ def evaluate_once() -> List[str]:
             rsi, ma60, ma240 = compute_indicators(df)
             print(f"[DEBUG] {pair} RSI14={rsi:.2f} SMA60={ma60:.4f} SMA240={ma240:.4f}")
             if condition_to_buy(rsi, ma60, ma240):
-                # Present nicely in SMS (BTCUSD)
+                # Present nicely in Telegram (BTCUSD)
                 label = pair.replace("/", "")
                 candidates.append(label)
         except Exception as e:
@@ -214,7 +222,7 @@ def loop_forever():
         if picks:
             msg = f"BUY SIGNAL {now_utc().strftime('%Y-%m-%d %H:%M:%SZ')}: " + ", ".join(picks)
             print("[ALERT] ", msg)
-            send_sms(msg)
+            send_telegram(msg)
         else:
             print("[INFO] No signals this interval.")
 
@@ -236,8 +244,10 @@ if __name__ == "__main__":
     if missing:
         raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
 
-    # Send a one-time boot SMS if enabled
-    if SEND_BOOT_SMS:
-        send_sms(f"✅ Bot started successfully at {now_utc().strftime('%Y-%m-%d %H:%M:%SZ')} (15m; ETFs: {', '.join(STOCK_ETFS)}; Crypto: {', '.join([p.replace('/', '') for p in CRYPTO_PAIRS])})")
+    if SEND_BOOT_TELEGRAM:
+        send_telegram(
+            f"✅ Bot started at {now_utc().strftime('%Y-%m-%d %H:%M:%SZ')} "
+            f"(15m; ETFs: {', '.join(STOCK_ETFS)}; Crypto: {', '.join([p.replace('/', '') for p in CRYPTO_PAIRS])})"
+        )
 
     loop_forever()
