@@ -39,8 +39,9 @@ CRYPTO_PAIRS: List[str] = ["BTC/USD"]          # Alpaca crypto symbol format
 # 15-minute bars
 TIMEFRAME = TimeFrame(15, TimeFrameUnit.Minute)
 
-# Need at least 240 bars for long SMA; fetch a cushion
-LOOKBACK_BARS = 280
+# Need at least 240 bars for long SMA
+LOOKBACK_DAYS_STOCK = 30         # calendar days for equities (market hours only)
+LOOKBACK_BARS_CRYPTO = 280       # bars for crypto (24/7), keeps cushion
 
 # ───────────────────────────
 # Helpers
@@ -68,7 +69,7 @@ def send_sms(message: str):
     print("[INFO] SMS sent")
 
 def to_df_from_bars_list(bars_list) -> pd.DataFrame:
-    """Convert a list of Bar objects to a DataFrame we expect."""
+    """Convert a list of Bar objects to a DataFrame."""
     rows = []
     for b in bars_list:
         rows.append({
@@ -88,7 +89,6 @@ def to_df_from_response(resp, symbol: str) -> pd.DataFrame:
         bars_list = resp.data.get(symbol, [])
         return to_df_from_bars_list(bars_list)
     if hasattr(resp, "df") and isinstance(resp.df, pd.DataFrame) and not resp.df.empty:
-        # resp.df index: ('symbol', timestamp) or (timestamp) depending on API
         df = resp.df.copy()
         if "symbol" in df.index.names:
             try:
@@ -132,7 +132,8 @@ crypto_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 # Fetchers
 # ───────────────────────────
 def fetch_stock_bars(symbol: str, end: datetime) -> pd.DataFrame:
-    start = end - timedelta(minutes=LOOKBACK_BARS * 15 + 60)
+    # Fetch ~30 calendar days to accumulate >=240 15m bars (market hours only)
+    start = end - timedelta(days=LOOKBACK_DAYS_STOCK)
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=TIMEFRAME,
@@ -140,21 +141,22 @@ def fetch_stock_bars(symbol: str, end: datetime) -> pd.DataFrame:
         end=end,
         adjustment=Adjustment.SPLIT,
         feed=DataFeed.IEX if ALPACA_PAPER else DataFeed.SIP,
-        limit=LOOKBACK_BARS,
+        limit=10000,  # high cap to avoid truncation
     )
-    resp = stock_client.get_stock_bars(req)  # ← FIXED METHOD NAME
+    resp = stock_client.get_stock_bars(req)
     return to_df_from_response(resp, symbol)
 
 def fetch_crypto_bars(pair: str, end: datetime) -> pd.DataFrame:
-    start = end - timedelta(minutes=LOOKBACK_BARS * 15 + 60)
+    # Crypto trades 24/7; bar count is straightforward
+    start = end - timedelta(minutes=LOOKBACK_BARS_CRYPTO * 15 + 60)
     req = CryptoBarsRequest(
         symbol_or_symbols=pair,
         timeframe=TIMEFRAME,
         start=start,
         end=end,
-        limit=LOOKBACK_BARS,
+        limit=LOOKBACK_BARS_CRYPTO,
     )
-    resp = crypto_client.get_crypto_bars(req)  # ← FIXED METHOD NAME
+    resp = crypto_client.get_crypto_bars(req)
     return to_df_from_response(resp, pair)
 
 # ───────────────────────────
