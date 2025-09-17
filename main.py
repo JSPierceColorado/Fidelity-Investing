@@ -67,11 +67,12 @@ def send_sms(message: str):
     client.messages.create(body=message, from_=TWILIO_FROM, to=ALERT_TO)
     print("[INFO] SMS sent")
 
-def to_df(bars) -> pd.DataFrame:
+def to_df_from_bars_list(bars_list) -> pd.DataFrame:
+    """Convert a list of Bar objects to a DataFrame we expect."""
     rows = []
-    for b in bars:
+    for b in bars_list:
         rows.append({
-            "t": b.timestamp,  # timezone-aware UTC (pandas will keep tz)
+            "t": b.timestamp,  # tz-aware UTC
             "o": float(b.open),
             "h": float(b.high),
             "l": float(b.low),
@@ -80,6 +81,27 @@ def to_df(bars) -> pd.DataFrame:
         })
     df = pd.DataFrame(rows).sort_values("t").reset_index(drop=True)
     return df
+
+def to_df_from_response(resp, symbol: str) -> pd.DataFrame:
+    """Handle both resp.data (dict->list[Bar]) and resp.df (MultiIndex DataFrame)."""
+    if hasattr(resp, "data") and resp.data:
+        bars_list = resp.data.get(symbol, [])
+        return to_df_from_bars_list(bars_list)
+    if hasattr(resp, "df") and isinstance(resp.df, pd.DataFrame) and not resp.df.empty:
+        # resp.df index: ('symbol', timestamp) or (timestamp) depending on API
+        df = resp.df.copy()
+        if "symbol" in df.index.names:
+            try:
+                df = df.xs(symbol, level="symbol")
+            except Exception:
+                pass
+        df = df.reset_index().rename(columns={
+            "timestamp": "t", "open": "o", "high": "h", "low": "l", "close": "c", "volume": "v"
+        })
+        keep = ["t", "o", "h", "l", "c", "v"]
+        df = df[[c for c in keep if c in df.columns]].sort_values("t").reset_index(drop=True)
+        return df
+    return pd.DataFrame(columns=["t","o","h","l","c","v"])
 
 def compute_indicators(df: pd.DataFrame):
     # Close series
@@ -120,10 +142,8 @@ def fetch_stock_bars(symbol: str, end: datetime) -> pd.DataFrame:
         feed=DataFeed.IEX if ALPACA_PAPER else DataFeed.SIP,
         limit=LOOKBACK_BARS,
     )
-    resp = stock_client.get_bars(req)
-    # In alpaca-py 0.23.0, use resp.data[symbol] if present
-    bars = resp.data.get(symbol, [])
-    return to_df(bars)
+    resp = stock_client.get_stock_bars(req)  # ← FIXED METHOD NAME
+    return to_df_from_response(resp, symbol)
 
 def fetch_crypto_bars(pair: str, end: datetime) -> pd.DataFrame:
     start = end - timedelta(minutes=LOOKBACK_BARS * 15 + 60)
@@ -134,9 +154,8 @@ def fetch_crypto_bars(pair: str, end: datetime) -> pd.DataFrame:
         end=end,
         limit=LOOKBACK_BARS,
     )
-    resp = crypto_client.get_bars(req)
-    bars = resp.data.get(pair, [])
-    return to_df(bars)
+    resp = crypto_client.get_crypto_bars(req)  # ← FIXED METHOD NAME
+    return to_df_from_response(resp, pair)
 
 # ───────────────────────────
 # Main evaluation loop
