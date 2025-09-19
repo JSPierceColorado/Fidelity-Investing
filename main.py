@@ -15,11 +15,16 @@ Env vars:
   TELEGRAM_BOT_TOKEN=123456:ABC...
   TELEGRAM_CHAT_ID=123456789           # or -100xxxxxxxxxxxx for groups/channels
   SEND_BOOT_TELEGRAM=true|false
+
+  # Optional (where to persist last-alert dates)
+  ALERT_LOG_PATH=/mnt/data/alert_log.json
 """
 
 import os
 import time
 import math
+import json
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import List
 
@@ -49,6 +54,9 @@ ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() in {"1", "true", "yes"}
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SEND_BOOT_TELEGRAM = os.getenv("SEND_BOOT_TELEGRAM", "false").lower() in {"1", "true", "yes"}
+
+# Where we persist per-asset last-alert dates (UTC YYYY-MM-DD)
+ALERT_LOG_PATH = Path(os.getenv("ALERT_LOG_PATH", "/tmp/alert_log.json"))
 
 # Assets to monitor (VNQ removed)
 STOCK_ETFS: List[str] = ["VIG", "BND", "GLD"]
@@ -87,7 +95,7 @@ def send_telegram(text: str):
     if r.ok:
         print("[INFO] Telegram sent")
     else:
-        print("[ERROR] Telegram failed", r.status_code, r.text)
+        print(f"[ERROR] Telegram failed {r.status_code} {r.text}")
 
 def to_df_from_bars_list(bars_list) -> pd.DataFrame:
     """Convert a list of Bar objects to a DataFrame."""
@@ -138,6 +146,46 @@ def condition_to_buy(rsi, ma60, ma240) -> bool:
     if any(is_nan_or_inf(v) for v in [rsi, ma60, ma240]):
         return False
     return (rsi <= 30) and (ma60 < ma240)
+
+# ── Alert deduplication (one alert per asset per UTC day) ──────────
+def utc_date_str(dt: datetime) -> str:
+    """Return YYYY-MM-DD for a tz-aware UTC datetime."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+
+def load_alert_log() -> dict:
+    """Load per-asset last-alert UTC dates from disk."""
+    try:
+        if ALERT_LOG_PATH.exists():
+            with ALERT_LOG_PATH.open("r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return {str(k): str(v) for k, v in data.items()}
+    except Exception as e:
+        print(f"[WARN] Failed to load alert log: {e}")
+    return {}
+
+def save_alert_log(log: dict):
+    """Persist the alert log to disk."""
+    try:
+        ALERT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with ALERT_LOG_PATH.open("w") as f:
+            json.dump(log, f)
+    except Exception as e:
+        print(f"[WARN] Failed to save alert log: {e}")
+
+def should_alert(asset: str, ts: datetime, log: dict) -> bool:
+    """True if we have not sent an alert for `asset` on the UTC day of `ts`."""
+    today = utc_date_str(ts)
+    last = log.get(asset)
+    return last != today
+
+def mark_alert(asset: str, ts: datetime, log: dict):
+    """Record that we sent an alert for `asset` on the UTC day of `ts`."""
+    log[asset] = utc_date_str(ts)
+    save_alert_log(log)
+
+# Initialize alert log after helpers are defined
+ALERT_LOG = load_alert_log()
 
 # ───────────────────────────
 # Data clients
@@ -218,11 +266,17 @@ def evaluate_once() -> List[str]:
 def loop_forever():
     while True:
         picks = evaluate_once()
+        ts_now = now_utc()
+
         if picks:
             for asset in picks:
-                msg = f"buy {asset}"  # minimal alert; no timestamp
-                print("[ALERT]", msg)
-                send_telegram(msg)
+                if should_alert(asset, ts_now, ALERT_LOG):
+                    msg = f"buy {asset}"  # minimal alert; no timestamp
+                    print("[ALERT]", msg)
+                    send_telegram(msg)
+                    mark_alert(asset, ts_now, ALERT_LOG)
+                else:
+                    print(f"[INFO] Skipping duplicate alert for {asset} on {utc_date_str(ts_now)}")
         else:
             print("[INFO] No signals this interval.")
 
