@@ -26,7 +26,7 @@ import math
 import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -65,9 +65,9 @@ CRYPTO_PAIRS: List[str] = ["BTC/USD"]  # Alpaca crypto symbol format
 # 15-minute bars
 TIMEFRAME = TimeFrame(15, TimeFrameUnit.Minute)
 
-# Need at least 240 bars for long SMA
-LOOKBACK_DAYS_STOCK = 30     # calendar days (market hours only)
-LOOKBACK_BARS_CRYPTO = 280   # bars for crypto (24/7), keeps cushion
+# Need at least 240 bars for long SMA (stocks) and 720 bars for BTC crypto rule
+LOOKBACK_DAYS_STOCK = 30       # calendar days (market hours only)
+LOOKBACK_BARS_CRYPTO = 900     # ↑ ensure >=720 bars + cushion for BTC rule
 
 # ───────────────────────────
 # Helpers
@@ -132,20 +132,37 @@ def to_df_from_response(resp, symbol: str) -> pd.DataFrame:
         return df
     return pd.DataFrame(columns=["t","o","h","l","c","v"])
 
-def compute_indicators(df: pd.DataFrame):
+# ── Indicators ─────────────────────────────────────────────────────
+def compute_indicators(df: pd.DataFrame) -> Tuple[float, float, float]:
+    """RSI14, SMA60, SMA240 — used for stocks/ETFs."""
     c = df["c"].astype(float)
     rsi14 = ta.rsi(c, length=14)
     sma60 = ta.sma(c, length=60)
     sma240 = ta.sma(c, length=240)
-    return rsi14.iloc[-1], sma60.iloc[-1], sma240.iloc[-1]
+    return float(rsi14.iloc[-1]), float(sma60.iloc[-1]), float(sma240.iloc[-1])
+
+def compute_indicators_ma(df: pd.DataFrame, short_len: int, long_len: int) -> Tuple[float, float, float]:
+    """RSI14, SMA(short_len), SMA(long_len) — generic (used for BTC rule)."""
+    c = df["c"].astype(float)
+    rsi14 = ta.rsi(c, length=14)
+    sma_s = ta.sma(c, length=short_len)
+    sma_l = ta.sma(c, length=long_len)
+    return float(rsi14.iloc[-1]), float(sma_s.iloc[-1]), float(sma_l.iloc[-1])
 
 def is_nan_or_inf(x: float) -> bool:
     return x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))
 
 def condition_to_buy(rsi, ma60, ma240) -> bool:
+    """Stocks/ETFs rule: RSI14 < 30 and SMA60 < SMA240."""
     if any(is_nan_or_inf(v) for v in [rsi, ma60, ma240]):
         return False
-    return (rsi <= 30) and (ma60 < ma240)
+    return (rsi < 30) and (ma60 < ma240)
+
+def condition_to_buy_btc(rsi, ma180, ma720) -> bool:
+    """BTC rule: RSI14 < 30 and SMA180 < SMA720."""
+    if any(is_nan_or_inf(v) for v in [rsi, ma180, ma720]):
+        return False
+    return (rsi < 30) and (ma180 < ma720)
 
 # ── Alert deduplication (one alert per asset per UTC day) ──────────
 def utc_date_str(dt: datetime) -> str:
@@ -212,7 +229,8 @@ def fetch_stock_bars(symbol: str, end: datetime) -> pd.DataFrame:
     return to_df_from_response(resp, symbol)
 
 def fetch_crypto_bars(pair: str, end: datetime) -> pd.DataFrame:
-    # Crypto trades 24/7; bar count is straightforward
+    # Crypto trades 24/7; bar count is straightforward.
+    # Need >=720 bars for BTC rule; request with cushion.
     start = end - timedelta(minutes=LOOKBACK_BARS_CRYPTO * 15 + 60)
     req = CryptoBarsRequest(
         symbol_or_symbols=pair,
@@ -232,7 +250,7 @@ def evaluate_once() -> List[str]:
     print(f"[INFO] Evaluating at {ts.isoformat()}")
     candidates: List[str] = []
 
-    # Stocks/ETFs
+    # Stocks/ETFs (RSI<30 & SMA60<SMA240)
     for sym in STOCK_ETFS:
         try:
             df = fetch_stock_bars(sym, ts)
@@ -246,16 +264,16 @@ def evaluate_once() -> List[str]:
         except Exception as e:
             print(f"[ERROR] {sym} fetch/eval failed: {e}")
 
-    # Crypto
+    # Crypto (BTC rule: RSI<30 & SMA180<SMA720)
     for pair in CRYPTO_PAIRS:
         try:
             df = fetch_crypto_bars(pair, ts)
-            if len(df) < 240:
-                print(f"[WARN] {pair}: insufficient bars ({len(df)})")
+            if len(df) < 720:
+                print(f"[WARN] {pair}: insufficient bars for BTC rule ({len(df)})")
                 continue
-            rsi, ma60, ma240 = compute_indicators(df)
-            print(f"[DEBUG] {pair} RSI14={rsi:.2f} SMA60={ma60:.4f} SMA240={ma240:.4f}")
-            if condition_to_buy(rsi, ma60, ma240):
+            rsi, ma180, ma720 = compute_indicators_ma(df, 180, 720)
+            print(f"[DEBUG] {pair} RSI14={rsi:.2f} SMA180={ma180:.4f} SMA720={ma720:.4f}")
+            if condition_to_buy_btc(rsi, ma180, ma720):
                 label = pair.replace("/", "")  # BTC/USD -> BTCUSD
                 candidates.append(label)
         except Exception as e:
