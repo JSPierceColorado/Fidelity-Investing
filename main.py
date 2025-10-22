@@ -67,7 +67,7 @@ TIMEFRAME = TimeFrame(15, TimeFrameUnit.Minute)
 
 # Need at least 240 bars for long SMA
 LOOKBACK_DAYS_STOCK = 30     # calendar days (market hours only)
-LOOKBACK_BARS_CRYPTO = 280   # bars for crypto (24/7), keeps cushion
+LOOKBACK_BARS_CRYPTO = 720   # updated to support SMA720
 
 # ───────────────────────────
 # Helpers
@@ -250,12 +250,16 @@ def evaluate_once() -> List[str]:
     for pair in CRYPTO_PAIRS:
         try:
             df = fetch_crypto_bars(pair, ts)
-            if len(df) < 240:
+            # Require at least 720 bars for SMA720
+            if len(df) < 720:
                 print(f"[WARN] {pair}: insufficient bars ({len(df)})")
                 continue
-            rsi, ma60, ma240 = compute_indicators(df)
-            print(f"[DEBUG] {pair} RSI14={rsi:.2f} SMA60={ma60:.4f} SMA240={ma240:.4f}")
-            if condition_to_buy(rsi, ma60, ma240):
+            c = df["c"].astype(float)
+            rsi = ta.rsi(c, length=14).iloc[-1]
+            ma180 = ta.sma(c, length=180).iloc[-1]
+            ma720 = ta.sma(c, length=720).iloc[-1]
+            print(f"[DEBUG] {pair} RSI14={rsi:.2f} SMA180={ma180:.4f} SMA720={ma720:.4f}")
+            if condition_to_buy(rsi, ma180, ma720):
                 label = pair.replace("/", "")  # BTC/USD -> BTCUSD
                 candidates.append(label)
         except Exception as e:
