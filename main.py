@@ -69,6 +69,9 @@ TIMEFRAME = TimeFrame(15, TimeFrameUnit.Minute)
 LOOKBACK_DAYS_STOCK = 30       # calendar days (market hours only)
 LOOKBACK_BARS_CRYPTO = 900     # ↑ ensure >=720 bars + cushion for BTC rule
 
+# Daily timeframe for ATH checks
+TIMEFRAME_DAILY = TimeFrame(1, TimeFrameUnit.Day)
+
 # ───────────────────────────
 # Helpers
 # ───────────────────────────
@@ -211,6 +214,89 @@ stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 crypto_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
 # ───────────────────────────
+# ATH helpers (minimal-impact add)
+# ───────────────────────────
+def is_crypto_label(asset: str) -> bool:
+    """Detect alert labels like 'BTCUSD' (or raw pairs containing '/')."""
+    return asset.upper().endswith("USD") or ("/" in asset)
+
+def to_pair_from_label(asset: str) -> str:
+    """Convert 'BTCUSD' -> 'BTC/USD' (no-op if already a pair)."""
+    return f"{asset[:-3]}/{asset[-3:]}" if "/" not in asset else asset
+
+def fetch_daily_ath_and_last(symbol_or_pair: str, is_crypto: bool) -> Tuple[float, float]:
+    """
+    Return (ath_high, last_close). Raises on hard failures.
+    Uses deep daily history to approximate "all-time" within provider coverage.
+    """
+    start_stocks = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    start_crypto = datetime(2015, 1, 1, tzinfo=timezone.utc)
+    end = now_utc()
+
+    if is_crypto:
+        req = CryptoBarsRequest(
+            symbol_or_symbols=symbol_or_pair,
+            timeframe=TIMEFRAME_DAILY,
+            start=start_crypto,
+            end=end,
+            limit=100000,
+        )
+        resp = crypto_client.get_crypto_bars(req)
+        df = to_df_from_response(resp, symbol_or_pair)
+    else:
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol_or_pair,
+            timeframe=TIMEFRAME_DAILY,
+            start=start_stocks,
+            end=end,
+            adjustment=Adjustment.SPLIT,
+            feed=DataFeed.IEX if ALPACA_PAPER else DataFeed.SIP,
+            limit=100000,
+        )
+        resp = stock_client.get_stock_bars(req)
+        df = to_df_from_response(resp, symbol_or_pair)
+
+    if df.empty:
+        raise RuntimeError("No daily bars")
+
+    ath = float(df["h"].max())
+    last_close = float(df["c"].iloc[-1])
+    if ath <= 0 or last_close <= 0:
+        raise RuntimeError("Nonpositive prices encountered")
+    return ath, last_close
+
+def compute_pct_down_from_ath(asset_label: str) -> float:
+    """
+    asset_label is like 'VIG' or 'BTCUSD' (your existing alert label).
+    Returns % down from ATH as a positive float (e.g., 23.4),
+    or raises if it cannot compute.
+    """
+    if is_crypto_label(asset_label):
+        pair = to_pair_from_label(asset_label)  # 'BTCUSD' -> 'BTC/USD'
+        ath, last_close = fetch_daily_ath_and_last(pair, is_crypto=True)
+    else:
+        ath, last_close = fetch_daily_ath_and_last(asset_label, is_crypto=False)
+
+    pct_down = max(0.0, (ath - last_close) / ath * 100.0)
+    return pct_down
+
+def grade_buy(pct_down: float) -> str:
+    """
+    Buckets:
+      - ≤10%   → 'weak buy'
+      - >10–25%→ 'moderate buy'
+      - ≥50%   → 'strong buy'
+      - else   → 'buy'
+    """
+    if pct_down <= 10.0:
+        return "weak buy"
+    if pct_down <= 25.0:
+        return "moderate buy"
+    if pct_down >= 50.0:
+        return "strong buy"
+    return "buy"
+
+# ───────────────────────────
 # Fetchers
 # ───────────────────────────
 def fetch_stock_bars(symbol: str, end: datetime) -> pd.DataFrame:
@@ -258,7 +344,16 @@ def evaluate_once() -> List[str]:
                 print(f"[WARN] {sym}: insufficient bars ({len(df)})")
                 continue
             rsi, ma60, ma240 = compute_indicators(df)
-            print(f"[DEBUG] {sym} RSI14={rsi:.2f} SMA60={ma60:.4f} SMA240={ma240:.4f}")
+
+            # Log %downATH for visibility
+            try:
+                pct_down = compute_pct_down_from_ath(sym)
+            except Exception as e:
+                pct_down = float('nan')
+                print(f"[WARN] {sym}: failed to get %downATH ({e})")
+
+            print(f"[DEBUG] {sym} RSI14={rsi:.2f} SMA60={ma60:.4f} SMA240={ma240:.4f} %downATH={pct_down:.1f}")
+
             if condition_to_buy(rsi, ma60, ma240):
                 candidates.append(sym)
         except Exception as e:
@@ -272,9 +367,19 @@ def evaluate_once() -> List[str]:
                 print(f"[WARN] {pair}: insufficient bars for BTC rule ({len(df)})")
                 continue
             rsi, ma180, ma720 = compute_indicators_ma(df, 180, 720)
-            print(f"[DEBUG] {pair} RSI14={rsi:.2f} SMA180={ma180:.4f} SMA720={ma720:.4f}")
-            if condition_to_buy_btc(rsi, ma180, ma720):
+
+            # Log %downATH for visibility (use BTCUSD label for grading/fetch)
+            try:
                 label = pair.replace("/", "")  # BTC/USD -> BTCUSD
+                pct_down = compute_pct_down_from_ath(label)
+            except Exception as e:
+                pct_down = float('nan')
+                print(f"[WARN] {pair}: failed to get %downATH ({e})")
+                label = pair.replace("/", "")
+
+            print(f"[DEBUG] {pair} RSI14={rsi:.2f} SMA180={ma180:.4f} SMA720={ma720:.4f} %downATH={pct_down:.1f}")
+
+            if condition_to_buy_btc(rsi, ma180, ma720):
                 candidates.append(label)
         except Exception as e:
             print(f"[ERROR] {pair} fetch/eval failed: {e}")
@@ -289,7 +394,15 @@ def loop_forever():
         if picks:
             for asset in picks:
                 if should_alert(asset, ts_now, ALERT_LOG):
-                    msg = f"buy {asset}"  # minimal alert; no timestamp
+                    # Upgrade message with %downATH-based grading; fall back to minimal 'buy'
+                    try:
+                        pct = compute_pct_down_from_ath(asset)
+                        label = grade_buy(pct)
+                        msg = f"{label} {asset}"  # keep minimal; add pct if desired
+                        # e.g., msg = f"{label} {asset} ({pct:.1f}% down from ATH)"
+                    except Exception as _e:
+                        msg = f"buy {asset}"
+
                     print("[ALERT]", msg)
                     send_telegram(msg)
                     mark_alert(asset, ts_now, ALERT_LOG)
