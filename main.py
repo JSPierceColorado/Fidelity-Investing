@@ -207,6 +207,9 @@ def mark_alert(asset: str, ts: datetime, log: dict):
 # Initialize alert log after helpers are defined
 ALERT_LOG = load_alert_log()
 
+# Cache of last computed %down-from-ATH per asset label (e.g. 'VIG', 'BTCUSD')
+LAST_PCT_DOWN: dict = {}
+
 # ───────────────────────────
 # Data clients
 # ───────────────────────────
@@ -283,18 +286,16 @@ def compute_pct_down_from_ath(asset_label: str) -> float:
 def grade_buy(pct_down: float) -> str:
     """
     Buckets:
-      - ≤10%   → 'weak buy'
-      - >10–25%→ 'moderate buy'
-      - ≥50%   → 'strong buy'
-      - else   → 'buy'
+      - ≤10%      → 'weak buy'
+      - 11–25%    → 'moderate buy'
+      - ≥26%      → 'strong buy'
     """
     if pct_down <= 10.0:
         return "weak buy"
-    if pct_down <= 25.0:
+    elif pct_down <= 25.0:
         return "moderate buy"
-    if pct_down >= 50.0:
+    else:
         return "strong buy"
-    return "buy"
 
 # ───────────────────────────
 # Fetchers
@@ -345,11 +346,13 @@ def evaluate_once() -> List[str]:
                 continue
             rsi, ma60, ma240 = compute_indicators(df)
 
-            # Log %downATH for visibility
+            # Log %downATH for visibility and cache it
             try:
                 pct_down = compute_pct_down_from_ath(sym)
+                LAST_PCT_DOWN[sym] = pct_down
             except Exception as e:
                 pct_down = float('nan')
+                LAST_PCT_DOWN[sym] = pct_down
                 print(f"[WARN] {sym}: failed to get %downATH ({e})")
 
             print(f"[DEBUG] {sym} RSI14={rsi:.2f} SMA60={ma60:.4f} SMA240={ma240:.4f} %downATH={pct_down:.1f}")
@@ -368,14 +371,15 @@ def evaluate_once() -> List[str]:
                 continue
             rsi, ma180, ma720 = compute_indicators_ma(df, 180, 720)
 
-            # Log %downATH for visibility (use BTCUSD label for grading/fetch)
+            # Log %downATH for visibility (use BTCUSD label for grading/fetch) and cache it
+            label = pair.replace("/", "")  # BTC/USD -> BTCUSD
             try:
-                label = pair.replace("/", "")  # BTC/USD -> BTCUSD
                 pct_down = compute_pct_down_from_ath(label)
+                LAST_PCT_DOWN[label] = pct_down
             except Exception as e:
                 pct_down = float('nan')
+                LAST_PCT_DOWN[label] = pct_down
                 print(f"[WARN] {pair}: failed to get %downATH ({e})")
-                label = pair.replace("/", "")
 
             print(f"[DEBUG] {pair} RSI14={rsi:.2f} SMA180={ma180:.4f} SMA720={ma720:.4f} %downATH={pct_down:.1f}")
 
@@ -396,11 +400,16 @@ def loop_forever():
                 if should_alert(asset, ts_now, ALERT_LOG):
                     # Upgrade message with %downATH-based grading; fall back to minimal 'buy'
                     try:
-                        pct = compute_pct_down_from_ath(asset)
+                        pct = LAST_PCT_DOWN.get(asset)
+                        if pct is None or is_nan_or_inf(pct):
+                            pct = compute_pct_down_from_ath(asset)
+                            LAST_PCT_DOWN[asset] = pct
+
                         label = grade_buy(pct)
                         msg = f"{label} {asset}"  # keep minimal; add pct if desired
                         # e.g., msg = f"{label} {asset} ({pct:.1f}% down from ATH)"
-                    except Exception as _e:
+                    except Exception as e:
+                        print(f"[WARN] grading failed for {asset}: {e}")
                         msg = f"buy {asset}"
 
                     print("[ALERT]", msg)
