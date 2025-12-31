@@ -59,7 +59,7 @@ SEND_BOOT_TELEGRAM = os.getenv("SEND_BOOT_TELEGRAM", "false").lower() in {"1", "
 ALERT_LOG_PATH = Path(os.getenv("ALERT_LOG_PATH", "/tmp/alert_log.json"))
 
 # Assets to monitor (VNQ removed)
-STOCK_ETFS: List[str] = ["VIG", "BND", "GLD"]
+STOCK_ETFS: List[str] = ["VIG", "BND", "GLD", "USDU"]
 CRYPTO_PAIRS: List[str] = ["BTC/USD"]  # Alpaca crypto symbol format
 
 # 15-minute bars
